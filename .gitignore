@@ -6,4 +6,6 @@
 /server
 /qdrive-client
 /qdrive-server
-
+/CMakeFiles
+CMakeCache.txt
+*.so
