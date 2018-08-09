@@ -1,11 +1,10 @@
 cmake_minimum_required(VERSION 3.5)
 project(mozquic)
 
-set(CMAKE_MODULE_PATH .)
+set(CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR})
 SET( CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS} -std=c++0x" )
 
 include(GNUInstallDirs)
-include_directories(../dist/public/nss/)
 
 set (
 	MOZQUIC_FILES
@@ -41,15 +40,19 @@ else ()
   message(FATAL_ERROR "Could not find NSS.")
 endif ()
 
+#### find NSPR ####
+find_package(NSPR)
+if(NSPR_FOUND)
+  include_directories(${NSPR_INCLUDE_DIRS})
+endif()
+
 #### LIBRARY AND EXECUTABLES ####
-
-set(LIBMOZQUIC_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/.")
-
 # ... something to build the library
 add_library(mozquic SHARED
 	${MOZQUIC_FILES}
 )
 target_link_libraries(mozquic
   ${NSS_LIBRARIES}
+  ${NSPR_LIBRARIES}
 )
 
