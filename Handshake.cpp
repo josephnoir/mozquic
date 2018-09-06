@@ -41,13 +41,15 @@ MozQuic::IntegrityCheck(unsigned char *pkt, uint32_t pktSize, uint32_t headerSiz
 
   uint32_t rv;
   if (mNSSHelper) {
-    rv = mNSSHelper->DecryptHandshake(pkt, headerSize, pkt + headerSize, pktSize - headerSize, packetNumber, handshakeCID,
-                                      outbuf + headerSize, kMozQuicMSS - headerSize, outSize);
+    rv = mNSSHelper->DecryptHandshake(pkt, headerSize, pkt + headerSize, pktSize - headerSize,
+                                      packetNumber,
+                                      handshakeCID, outbuf + headerSize, kMozQuicMSS - headerSize, outSize);
   } else {
     // need longheader.mdestcid
     assert ((pkt[0] & 0x7f) == PACKET_TYPE_INITIAL || (pkt[0] & 0x7f) == PACKET_TYPE_RETRY);
-    rv = NSSHelper::staticDecryptHandshake(pkt, headerSize, pkt + headerSize, pktSize - headerSize, packetNumber, handshakeCID,
-                                           outbuf + headerSize, kMozQuicMSS - headerSize, outSize);
+    rv = NSSHelper::staticDecryptHandshake(pkt, headerSize, pkt + headerSize, pktSize - headerSize,
+                                           packetNumber,
+                                           handshakeCID, outbuf + headerSize, kMozQuicMSS - headerSize, outSize);
   }
     
   if (rv != MOZQUIC_OK) {
@@ -58,6 +60,22 @@ MozQuic::IntegrityCheck(unsigned char *pkt, uint32_t pktSize, uint32_t headerSiz
   outSize += headerSize;
   ConnectionLog5("Decrypt handshake (packetNumber=%lX) ok sz=%d\n", packetNumber, outSize);
   return true;
+}
+
+void
+MozQuic::EncodePN(uint32_t pn, uint8_t *framePtr, size_t &outPNLen)
+{
+  if (pn >= 128) {
+    uint32_t tmp32 = htonl(pn & 0x3fffffff);
+    memcpy(framePtr, &tmp32, 4);
+    *framePtr = *framePtr | 0xC0; // 4 byte number
+    outPNLen = 4;
+  } else {
+    // 1 byte PN
+    *framePtr = pn;
+    assert( (*framePtr & 0x80) == 0);
+    outPNLen = 1;
+  }
 }
 
 uint32_t
@@ -111,14 +129,14 @@ MozQuic::FlushStream0(bool forceAck)
     return MOZQUIC_ERR_GENERAL;
   }
   framePtr += 2;
+  
+  uint32_t usedPacketNumber = (mConnectionState == SERVER_STATE_SSR) ?
+    0 : mNextTransmitPacketNumber;
 
-  tmp32 = htonl(mNextTransmitPacketNumber & 0xffffffff);
-  if (mConnectionState == SERVER_STATE_SSR) {
-    tmp32 = htonl(mClientInitialPacketNumber & 0xffffffff);
-  }
-  uint32_t usedPacketNumber = ntohl(tmp32);
-  memcpy(framePtr, &tmp32, 4);
-  framePtr += 4;
+  size_t pnLen;
+  const unsigned char *pnPtr = framePtr;
+  EncodePN(usedPacketNumber, framePtr, pnLen);
+  framePtr += pnLen;
 
   std::unique_ptr<TransmittedPacket> packet(new TransmittedPacket(mNextTransmitPacketNumber));
   unsigned char *emptyFramePtr = framePtr;
@@ -172,8 +190,8 @@ MozQuic::FlushStream0(bool forceAck)
 
     assert(mHandshakeCID);
     uint32_t rv = mNSSHelper->EncryptHandshake(pkt, headerLen, pkt + headerLen, framePtr - emptyFramePtr,
-                                               usedPacketNumber, mHandshakeCID,
-                                               cipherPkt + headerLen, kMozQuicMSS - headerLen, cipherLen);
+                                               usedPacketNumber,
+                                               mHandshakeCID, cipherPkt + headerLen, kMozQuicMSS - headerLen, cipherLen);
     if (rv != MOZQUIC_OK) {
       HandshakeLog1("TRANSMIT0[%lX] this=%p Encrypt Fail %x\n",
                     usedPacketNumber, this, rv);
@@ -181,7 +199,15 @@ MozQuic::FlushStream0(bool forceAck)
     }
     assert (cipherLen == (framePtr - emptyFramePtr) + 16);
     assert(cipherLen < 16383);
-
+    
+    // packet number encryption
+    assert(cipherPkt + (pnPtr - pkt) + 4 >= cipherPkt + headerLen); // pn + 4 is in ciphertext
+    assert(cipherPkt + (pnPtr - pkt) + 4 <= cipherPkt + headerLen + cipherLen);
+    
+    EncryptPNInPlace(kEncryptHandshake, cipherPkt + (pnPtr - pkt),
+                     cipherPkt + (pnPtr - pkt) + 4,
+                     (cipherPkt + headerLen + cipherLen) - (cipherPkt + (pnPtr - pkt) + 4));
+    
     uint32_t code = mSendState->Transmit(mNextTransmitPacketNumber, bareAck, false,
                                          packet->mQueueOnTransmit,
                                          cipherPkt, cipherLen + headerLen, nullptr);
@@ -202,7 +228,7 @@ MozQuic::FlushStream0(bool forceAck)
     Log::sDoLog(Log::HANDSHAKE, 5, this,
                 "TRANSMIT0[%lX] this=%p len=%d total0=%d byte0=%x\n",
                 usedPacketNumber, this, cipherLen + headerLen,
-                mNextTransmitPacketNumber - mOriginalTransmitPacketNumber,
+                mNextTransmitPacketNumber,
                 cipherPkt[0]);
 
     mNextTransmitPacketNumber++;
@@ -244,20 +270,8 @@ MozQuic::ProcessServerStatelessRetry(unsigned char *pkt, uint32_t pktSize, LongH
     mHandshakeCID = header.mSourceCID; // because its stateless
   }
 
-  // essentially this is an ack of client_initial using the packet #
-  // in the header as the ack, so need to find that on the unacked list.
-  // then we can reset the unacked list
-  bool foundReference = false;
-  for (auto i = mStreamState->mUnAckedPackets.begin(); i != mStreamState->mUnAckedPackets.end(); i++) {
-    if ((*i)->mPacketNumber == header.mPacketNumber) {
-      foundReference = true;
-      break;
-    }
-  }
-
-  if (!foundReference) {
-    // packet num was supposedly copied from client - so no match
-    HandshakeLog4("RETRY failed because packet number did not match an unacked initial\n");
+  if (header.mPacketNumber != 0) {
+    HandshakeLog4("RETRY failed because packet number was not 0\n");
     return MOZQUIC_ERR_VERSION;
   }
 

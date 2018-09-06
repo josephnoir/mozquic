@@ -33,10 +33,10 @@ namespace mozquic {
 //
 // sync with versionOK() and GenerateVersionNegotiation()
 static const uint32_t kMozQuicVersion1 = 0xf123f0c5; // 0xf123f0c* reserved for mozquic
-static const uint32_t kMozQuicIetfID11 = 0xff00000b;
+static const uint32_t kMozQuicIetfID12 = 0xff00000c;
 static const uint32_t kMozQuicVersionGreaseS = 0xea0a6a2a;
 static const uint32_t VersionNegotiationList[] = {
-  kMozQuicVersionGreaseS, kMozQuicIetfID11, kMozQuicVersion1,
+  kMozQuicVersionGreaseS, kMozQuicIetfID12, kMozQuicVersion1,
 };
 
 enum connectionState
@@ -161,6 +161,7 @@ class MozQuic
   friend class FrameHeaderData;
   friend class StreamState;
   friend class ConnIDTimeout;
+  friend class ShortHeaderData;
 
 public:
   static const char *kAlpn;
@@ -254,6 +255,8 @@ public:
 private:
   void RaiseError(uint32_t err, const char *fmt, ...);
 
+  static void EncodePN(uint32_t pn, uint8_t *framePtr, size_t &outPNLen);
+    
   void AckScoreboard(uint64_t num, enum keyPhase kp);
   int MaybeSendAck(bool delackOK = false);
 
@@ -325,11 +328,17 @@ public:
   static void EncodeVarintAs4(uint64_t input, unsigned char *dest);
   static void EncodeVarintAs8(uint64_t input, unsigned char *dest);
 
+  void DecryptPNInPlace(enum operationType mode, unsigned char *pn,
+                        const unsigned char *cipherTextToSample, uint32_t cipherLen);
+  void EncryptPNInPlace(enum operationType mode, unsigned char *pn,
+                        const unsigned char *cipherTextToSample, uint32_t cipherLen);
+
 private:
-  uint32_t CreateShortPacketHeader(unsigned char *pkt, uint32_t pktSize, uint32_t &used);
+  uint32_t CreateShortPacketHeader(unsigned char *pkt, uint32_t pktSize, uint32_t &used, unsigned char **pnPtrOut);
   uint32_t Create0RTTLongPacketHeader(unsigned char *pkt, uint32_t pktSize, uint32_t &used,
-                                      unsigned char **payloadLenPtr);
-  uint32_t ProtectedTransmit(unsigned char *header, uint32_t headerLen,
+                                      unsigned char **payloadLenPtr,
+                                      unsigned char **pnPtr);
+  uint32_t ProtectedTransmit(unsigned char *header, uint32_t headerLen, const unsigned char *pnPtr,
                              unsigned char *data, uint32_t dataLen, uint32_t dataAllocation,
                              bool addAcks, bool ackable, bool queueOnly = false,
                              uint32_t mtuOverride = 0, uint32_t *bytesOut = nullptr);
@@ -397,7 +406,6 @@ private:
   uint16_t mMTU;
   uint16_t mDropRate;
   uint64_t mNextTransmitPacketNumber;
-  uint64_t mOriginalTransmitPacketNumber;
   uint64_t mNextRecvPacketNumber; // expected
   uint64_t mClientInitialPacketNumber; // only set on child in server
 

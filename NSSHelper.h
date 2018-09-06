@@ -14,17 +14,6 @@ namespace mozquic {
 
 class MozQuic;
 
-enum operationType {
-  kEncrypt0,
-  kDecrypt0,
-//  kEncrypt1,
-//  kDecrypt1,
-  kEncryptHandshake,
-  kDecryptHandshake,
-  kEncrypt0RTT,
-  kDecrypt0RTT,
-};
-
 // if you Read() from the helper, it pulls through the tls layer from the mozquic::stream0 buffer where
 // peer data lke the client hello is stored.. if you Write() to the helper something
 // like "", the tls layer adds the server hello on the way out into mozquic::stream0
@@ -43,36 +32,42 @@ public:
 
   uint32_t EncryptBlock(const unsigned char *aeadData, uint32_t aeadLen,
                         const unsigned char *plaintext, uint32_t plaintextLen,
-                        uint64_t packetNumber, unsigned char *out, uint32_t outAvail,
-                        uint32_t &written);
+                        uint64_t packetNumber,
+                        unsigned char *out, uint32_t outAvail, uint32_t &written);
 
   uint32_t DecryptBlock(const unsigned char *aeadData, uint32_t aeadLen,
                         const unsigned char *ciphertext, uint32_t ciphertextLen,
-                        uint64_t packetNumber, unsigned char *out, uint32_t outAvail,
-                        uint32_t &written);
+                        uint64_t packetNumber,
+                        unsigned char *out, uint32_t outAvail, uint32_t &written);
 
 
   uint32_t EncryptHandshake(const unsigned char *aeadData, uint32_t aeadLen,
                             const unsigned char *plaintext, uint32_t plaintextLen,
-                            uint64_t packetNumber, CID cid,
-                            unsigned char *out, uint32_t outAvail,
-                            uint32_t &written);
+                            uint64_t packetNumber,
+                            CID cid, unsigned char *out, uint32_t outAvail, uint32_t &written);
 
   uint32_t DecryptHandshake(const unsigned char *aeadData, uint32_t aeadLen,
                             const unsigned char *ciphertext, uint32_t ciphertextLen,
-                            uint64_t packetNumber, CID cid,
-                            unsigned char *out, uint32_t outAvail,
-                            uint32_t &written);
+                            uint64_t packetNumber,
+                            CID cid, unsigned char *out, uint32_t outAvail, uint32_t &written);
 
   uint32_t EncryptBlock0RTT(const unsigned char *aeadData, uint32_t aeadLen,
                             const unsigned char *plaintext, uint32_t plaintextLen,
-                            uint64_t packetNumber, unsigned char *out, uint32_t outAvail,
-                            uint32_t &written);
+                            uint64_t packetNumber,
+                            unsigned char *out, uint32_t outAvail, uint32_t &written);
 
   uint32_t DecryptBlock0RTT(const unsigned char *aeadData, uint32_t aeadLen,
                             const unsigned char *ciphertext, uint32_t ciphertextLen,
-                            uint64_t packetNumber, unsigned char *out, uint32_t outAvail,
-                            uint32_t &written);
+                            uint64_t packetNumber,
+                            unsigned char *out, uint32_t outAvail, uint32_t &written);
+
+  CK_MECHANISM_TYPE ModeToMechanism(enum operationType mode);
+  PK11SymKey *      ModeToPNKey(enum operationType mode);
+  void     EncryptPNInPlace(enum operationType mode, unsigned char *pn,
+                            const unsigned char *cipherTextToSample,
+                            uint32_t cipherLen);
+  void DecryptPNInPlace(enum operationType mode, unsigned char *pn,
+                        const unsigned char *cipherTextToSample, uint32_t cipherLen);
 
   bool SetLocalTransportExtensionInfo(const unsigned char *data, uint16_t datalen); // local data to send
   bool SetRemoteTransportExtensionInfo(const unsigned char *data, uint16_t datalen); // remote data recvd
@@ -90,6 +85,10 @@ public:
   bool IsEarlyDataAcceptedClient();
 
 private:
+  static void DecryptPNInPlace(unsigned char *pn,
+                               CK_MECHANISM_TYPE mechToUse,
+                               PK11SymKey         *keyToUse,
+                               const unsigned char *cipherTextToSample, uint32_t cipherLen);
   void SharedInit();
   static PRStatus NSPRGetPeerName(PRFileDesc *aFD, PRNetAddr*addr);
   static PRStatus NSPRGetSocketOption(PRFileDesc *aFD, PRSocketOptionData *aOpt);
@@ -115,22 +114,29 @@ private:
   
   uint32_t BlockOperation(enum operationType mode, const unsigned char *aeadData, uint32_t aeadLen,
                           const unsigned char *plaintext, uint32_t plaintextLen,
-                          uint64_t packetNumber, unsigned char *out, uint32_t outAvail,
-                          uint32_t &written);
+                          uint64_t packetNumber,
+                          unsigned char *out, uint32_t outAvail, uint32_t &written);
+
   uint32_t MakeKeyFromNSS(PRFileDesc *fd, bool earlyKey, const char *label,
                           unsigned int secretSize, unsigned int keySize, SSLHashType hashType,
                           CK_MECHANISM_TYPE importMechanism1, CK_MECHANISM_TYPE importMechanism2,
-                          unsigned char *outIV, PK11SymKey **outKey);
+                          unsigned char *outIV, PK11SymKey **outKey, PK11SymKey **outPNKey);
+
 public:
   static uint32_t MakeKeyFromRaw(unsigned char *initialSecret,
-                          unsigned int secretSize, unsigned int keySize, SSLHashType hashType,
-                          CK_MECHANISM_TYPE importMechanism1, CK_MECHANISM_TYPE importMechanism2,
-                          unsigned char *outIV, PK11SymKey **outKey);
+                                 unsigned int secretSize, unsigned int keySize, SSLHashType hashType,
+                                 CK_MECHANISM_TYPE importMechanism1, CK_MECHANISM_TYPE importMechanism2,
+                                 unsigned char *outIV, PK11SymKey **outKey, PK11SymKey **outPNKey);
+
   static uint32_t staticDecryptHandshake(const unsigned char *aadData, uint32_t aadLen,
                                          const unsigned char *data, uint32_t dataLen,
                                          uint64_t packetNumber, CID connectionID,
                                          unsigned char *out, uint32_t outAvail, uint32_t &written);
-
+  static void     staticDecryptPNInPlace(unsigned char *pn,
+                                         CID connectionID,
+                                         const unsigned char *cipherTextToSample,
+                                         uint32_t cipherLen);
+  
   static uint64_t SockAddrHasher(const struct sockaddr *);
 
 private:
@@ -163,18 +169,23 @@ private:
   uint16_t            mRemoteTransportExtensionLen;
 
   CK_MECHANISM_TYPE   mPacketProtectionMech;
+  PK11SymKey         *mPacketProtectionSenderPNKey;
   PK11SymKey         *mPacketProtectionSenderKey0;
   unsigned char       mPacketProtectionSenderIV0[12];
+  PK11SymKey         *mPacketProtectionReceiverPNKey;
   PK11SymKey         *mPacketProtectionReceiverKey0;
   unsigned char       mPacketProtectionReceiverIV0[12];
 
   CK_MECHANISM_TYPE   mPacketProtectionMech0RTT;
   PK11SymKey         *mPacketProtectionKey0RTT;
+  PK11SymKey         *mPacketProtectionPNKey0RTT;
   unsigned char       mPacketProtectionIV0RTT[12];
 
   CID                 mPacketProtectionHandshakeCID;
+  PK11SymKey         *mPacketProtectionHandshakeSenderPNKey;
   PK11SymKey         *mPacketProtectionHandshakeSenderKey;
   unsigned char       mPacketProtectionHandshakeSenderIV[12];
+  PK11SymKey         *mPacketProtectionHandshakeReceiverPNKey;
   PK11SymKey         *mPacketProtectionHandshakeReceiverKey;
   unsigned char       mPacketProtectionHandshakeReceiverIV[12];
 };

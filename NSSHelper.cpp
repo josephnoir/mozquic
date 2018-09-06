@@ -308,11 +308,13 @@ uint32_t
 NSSHelper::MakeKeyFromRaw(unsigned char *initialSecret,
                           unsigned int secretSize, unsigned int keySize, SSLHashType hashType,
                           CK_MECHANISM_TYPE importMechanism1, CK_MECHANISM_TYPE importMechanism2,
-                          unsigned char *outIV, PK11SymKey **outKey)
+                          unsigned char *outIV, PK11SymKey **outKey, PK11SymKey **outPNKey)
 {
   PK11SymKey *finalKey = nullptr;
+  PK11SymKey *finalPNKey = nullptr;
   PK11SymKey *secretSKey = nullptr;
   unsigned char ppKey[32];
+  unsigned char pnKey[32];
   assert (secretSize <= 48);
   assert (keySize <= sizeof(ppKey));
 
@@ -333,9 +335,17 @@ NSSHelper::MakeKeyFromRaw(unsigned char *initialSecret,
     goto failure;
   }
 
-  // iv length is max(8, n_min) - n_min is aead specific, but is 12 for everything currently known
+  // iv length is always 12
   if (QHkdfExpandLabelRaw(secretSKey, hashType,
                           "iv", 2, outIV, 12) != SECSuccess) {
+    goto failure;
+  }
+
+  // assumes keySize for protection key is the same as the pnkey, which
+  // is probably not universally true but is true for the pn protection
+  // schemes currently defined
+  if (QHkdfExpandLabelRaw(secretSKey, hashType,
+                          "pn", 2, pnKey, keySize) != SECSuccess) {
     goto failure;
   }
 
@@ -348,11 +358,25 @@ NSSHelper::MakeKeyFromRaw(unsigned char *initialSecret,
     finalKey = PK11_ImportSymKey(slot, importMechanism2, PK11_OriginUnwrap,
                                  CKA_DERIVE, &ppKey_item, NULL);
   }
+
+  PK11_FreeSlot(slot);
+  if (!(slot = PK11_GetInternalSlot())){
+    goto failure;
+  }
+
+  {
+    SECItem pnKey_item = {siBuffer, pnKey, 16};
+    finalPNKey = PK11_ImportSymKey(slot, importMechanism2, PK11_OriginUnwrap,
+                                   CKA_DERIVE, &pnKey_item, NULL);
+  }
+  assert (finalPNKey);
+
   PK11_FreeSlot(slot);
   if (secretSKey) {
     PK11_FreeSymKey(secretSKey);
   }
   *outKey = finalKey;
+  *outPNKey = finalPNKey;
   return finalKey ? MOZQUIC_OK : MOZQUIC_ERR_CRYPTO;
 
 failure:
@@ -372,7 +396,7 @@ uint32_t
 NSSHelper::MakeKeyFromNSS(PRFileDesc *fd, bool earlyKey, const char *label,
                           unsigned int secretSize, unsigned int keySize, SSLHashType hashType,
                           CK_MECHANISM_TYPE importMechanism1, CK_MECHANISM_TYPE importMechanism2,
-                          unsigned char *outIV, PK11SymKey **outKey)
+                          unsigned char *outIV, PK11SymKey **outKey, PK11SymKey **outPNKey)
 {
   unsigned char initialSecret[48];
   assert (secretSize <= 48);
@@ -390,7 +414,7 @@ NSSHelper::MakeKeyFromNSS(PRFileDesc *fd, bool earlyKey, const char *label,
   }
 
   return MakeKeyFromRaw(initialSecret, secretSize, keySize, hashType, importMechanism1,
-                        importMechanism2, outIV, outKey);
+                        importMechanism2, outIV, outKey, outPNKey);
 }
 
 uint32_t
@@ -423,12 +447,14 @@ NSSHelper::HandshakeSecret(unsigned int ciphersuite,
 
   bool didHandshakeFail =
     MakeKeyFromRaw(mExternalSendSecret, secretSize, keySize, hashType, importMechanism1,
-                   importMechanism2, mPacketProtectionSenderIV0, &mPacketProtectionSenderKey0) != MOZQUIC_OK;
+                   importMechanism2, mPacketProtectionSenderIV0, &mPacketProtectionSenderKey0,
+                   &mPacketProtectionSenderPNKey) != MOZQUIC_OK;
   memset(mExternalSendSecret, 0, sizeof(mExternalSendSecret));
 
   didHandshakeFail = didHandshakeFail ||
     MakeKeyFromRaw(mExternalRecvSecret, secretSize, keySize, hashType, importMechanism1,
-                   importMechanism2, mPacketProtectionReceiverIV0, &mPacketProtectionReceiverKey0) != MOZQUIC_OK;
+                   importMechanism2, mPacketProtectionReceiverIV0, &mPacketProtectionReceiverKey0,
+                   &mPacketProtectionReceiverPNKey) != MOZQUIC_OK;
   memset(mExternalRecvSecret, 0, sizeof(mExternalRecvSecret));
 
   mHandshakeComplete = true;
@@ -539,20 +565,22 @@ NSSHelper::HRRCallback(PRBool firstHello, const unsigned char *clientToken,
   return ssl_hello_retry_request;
 }
 
+#define freeKey(x) do { if((x)) {PK11_FreeSymKey(x);} } while (0)
+
 class ServerHandshakeReceiverKeys
 {
 public:
   ~ServerHandshakeReceiverKeys() {
-    if (mPacketProtectionHandshakeReceiverKey) {
-      PK11_FreeSymKey(mPacketProtectionHandshakeReceiverKey);
-    }
+    freeKey(mPacketProtectionHandshakeReceiverKey);
+    freeKey(mPacketProtectionHandshakeReceiverPNKey);
   }
 
-  PK11SymKey *Take()
+  void Take(PK11SymKey **outKey, PK11SymKey **outPNKey)
   {
-    PK11SymKey *rv = mPacketProtectionHandshakeReceiverKey;
+    *outKey = mPacketProtectionHandshakeReceiverKey;
+    *outPNKey = mPacketProtectionHandshakeReceiverPNKey;
     mPacketProtectionHandshakeReceiverKey = nullptr;
-    return rv;
+    mPacketProtectionHandshakeReceiverPNKey = nullptr;
   }
 
   ServerHandshakeReceiverKeys(CID cid)
@@ -579,9 +607,12 @@ public:
         !handshakeSecret) {
       goto cleanup;
     }
-    assert (PK11_ExtractKeyValue(handshakeSecret) == SECSuccess);
-    assert (PK11_GetKeyData(handshakeSecret)->len == 32);
-
+    if (PK11_ExtractKeyValue(handshakeSecret) != SECSuccess) {
+      goto cleanup;
+    }
+    if (PK11_GetKeyData(handshakeSecret)->len != 32) {
+      goto cleanup;
+    }
     if (QHkdfExpandLabelRaw(handshakeSecret, ssl_hash_sha256,
                             kHandshakeClientLabel, strlen(kHandshakeClientLabel),
                             expandOut, 32) != SECSuccess) {
@@ -590,7 +621,9 @@ public:
 
     NSSHelper::MakeKeyFromRaw(expandOut, 32, 16, ssl_hash_sha256,
                               CKM_NSS_HKDF_SHA256, CKM_AES_KEY_GEN,
-                              mPacketProtectionHandshakeReceiverIV, &mPacketProtectionHandshakeReceiverKey);
+                              mPacketProtectionHandshakeReceiverIV,
+                              &mPacketProtectionHandshakeReceiverKey,
+                              &mPacketProtectionHandshakeReceiverPNKey);
 
   cleanup:
     if (slot) {
@@ -604,6 +637,7 @@ public:
     }
   }
 
+  PK11SymKey    *mPacketProtectionHandshakeReceiverPNKey;
   PK11SymKey    *mPacketProtectionHandshakeReceiverKey;
   unsigned char  mPacketProtectionHandshakeReceiverIV[12];
 };
@@ -650,10 +684,13 @@ NSSHelper::MakeHandshakeKeys(CID cid)
 
     MakeKeyFromRaw(expandOut, 32, 16, ssl_hash_sha256,
                    CKM_NSS_HKDF_SHA256, CKM_AES_KEY_GEN,
-                   mPacketProtectionHandshakeSenderIV, &mPacketProtectionHandshakeSenderKey);
+                   mPacketProtectionHandshakeSenderIV,
+                   &mPacketProtectionHandshakeSenderKey,
+                   &mPacketProtectionHandshakeSenderPNKey);
   } else {
     ServerHandshakeReceiverKeys skey(mPacketProtectionHandshakeCID);
-    mPacketProtectionHandshakeReceiverKey = skey.Take();
+    skey.Take(&mPacketProtectionHandshakeReceiverKey,
+              &mPacketProtectionHandshakeReceiverPNKey);
     memcpy(mPacketProtectionHandshakeReceiverIV,
            skey.mPacketProtectionHandshakeReceiverIV,
            sizeof(mPacketProtectionHandshakeReceiverIV));
@@ -668,11 +705,15 @@ NSSHelper::MakeHandshakeKeys(CID cid)
   if (mIsClient) {
     MakeKeyFromRaw(expandOut, 32, 16, ssl_hash_sha256,
                    CKM_NSS_HKDF_SHA256, CKM_AES_KEY_GEN,
-                   mPacketProtectionHandshakeReceiverIV, &mPacketProtectionHandshakeReceiverKey);
+                   mPacketProtectionHandshakeReceiverIV,
+                   &mPacketProtectionHandshakeReceiverKey,
+                   &mPacketProtectionHandshakeReceiverPNKey);
   } else {
     MakeKeyFromRaw(expandOut, 32, 16, ssl_hash_sha256,
                    CKM_NSS_HKDF_SHA256, CKM_AES_KEY_GEN,
-                   mPacketProtectionHandshakeSenderIV, &mPacketProtectionHandshakeSenderKey);
+                   mPacketProtectionHandshakeSenderIV,
+                   &mPacketProtectionHandshakeSenderKey,
+                   &mPacketProtectionHandshakeSenderPNKey);
   }
 
 cleanup:
@@ -728,23 +769,27 @@ NSSHelper::HandshakeCallback(PRFileDesc *fd, void *)
   if (self->mIsClient) {
     if (self->MakeKeyFromNSS(fd, false, k1RTTClientLabel,
                              secretSize, keySize, hashType, importMechanism1, importMechanism2,
-                             self->mPacketProtectionSenderIV0, &self->mPacketProtectionSenderKey0) != MOZQUIC_OK) {
+                             self->mPacketProtectionSenderIV0,
+                             &self->mPacketProtectionSenderKey0, &self->mPacketProtectionSenderPNKey) != MOZQUIC_OK) {
       didHandshakeFail = true;
     }
     if (self->MakeKeyFromNSS(fd, false, k1RTTServerLabel,
                              secretSize, keySize, hashType, importMechanism1, importMechanism2,
-                             self->mPacketProtectionReceiverIV0, &self->mPacketProtectionReceiverKey0) != MOZQUIC_OK) {
+                             self->mPacketProtectionReceiverIV0,
+                             &self->mPacketProtectionReceiverKey0, &self->mPacketProtectionReceiverPNKey) != MOZQUIC_OK) {
       didHandshakeFail = true;
     }
   } else {
     if (self->MakeKeyFromNSS(fd, false, k1RTTServerLabel,
                              secretSize, keySize, hashType, importMechanism1, importMechanism2,
-                             self->mPacketProtectionSenderIV0, &self->mPacketProtectionSenderKey0) != MOZQUIC_OK) {
+                             self->mPacketProtectionSenderIV0,
+                             &self->mPacketProtectionSenderKey0, &self->mPacketProtectionSenderPNKey) != MOZQUIC_OK) {
       didHandshakeFail = true;
     }
     if (self->MakeKeyFromNSS(fd, false, k1RTTClientLabel,
                              secretSize, keySize, hashType, importMechanism1, importMechanism2,
-                             self->mPacketProtectionReceiverIV0, &self->mPacketProtectionReceiverKey0) != MOZQUIC_OK) {
+                             self->mPacketProtectionReceiverIV0,
+                             &self->mPacketProtectionReceiverKey0, &self->mPacketProtectionReceiverPNKey) != MOZQUIC_OK) {
       didHandshakeFail = true;
     }
   }
@@ -870,7 +915,165 @@ NSSHelper::BlockOperation(enum operationType mode,
                       data, dataLen) == SECSuccess ? MOZQUIC_OK : MOZQUIC_ERR_GENERAL;
   }
   written = enlen;
+
   return rv;
+}
+
+CK_MECHANISM_TYPE
+NSSHelper::ModeToMechanism(enum operationType mode)
+{
+  if (mode == kEncryptHandshake || mode == kDecryptHandshake) {
+    return CKM_AES_CTR;
+  }
+
+  CK_MECHANISM_TYPE mech;
+  if (mode == kEncrypt0 || mode == kDecrypt0) {
+    mech = mPacketProtectionMech;
+  } else {
+    mech = mPacketProtectionMech0RTT;
+  }
+
+  return mech == CKM_NSS_CHACHA20_POLY1305 ? CKM_NSS_CHACHA20_POLY1305 : CKM_AES_CTR;
+}
+
+PK11SymKey *
+NSSHelper::ModeToPNKey(enum operationType mode)
+{
+  switch (mode) {
+  case kEncrypt0:
+    return mPacketProtectionSenderPNKey;
+  case kDecrypt0:
+    return mPacketProtectionReceiverPNKey;
+  case kEncryptHandshake:
+    return mPacketProtectionHandshakeSenderPNKey;
+  case kDecryptHandshake:
+    return mPacketProtectionHandshakeReceiverPNKey;
+  case kEncrypt0RTT:
+  case kDecrypt0RTT:
+    return mPacketProtectionPNKey0RTT;
+  }
+}
+
+void
+NSSHelper::EncryptPNInPlace(enum operationType mode, unsigned char *pn,
+                            const unsigned char *cipherTextToSample,
+                            uint32_t cipherLen)
+{
+  assert (mode == kEncrypt0 || mode == kEncryptHandshake || kEncrypt0RTT);
+  CK_MECHANISM_TYPE mech = ModeToMechanism(mode);
+  PK11SymKey *key = ModeToPNKey(mode);
+  if (!key) {
+    return;
+  }
+
+  size_t pnLen = 4;
+  if ((*pn & 0x80) == 0) {
+    pnLen = 1;
+  } else if ((*pn & 0xC0) == 0x80) {
+    pnLen = 2;
+  }
+
+  unsigned char *params;
+  unsigned int paramsLength;
+  if (mech == CKM_AES_CTR) {
+    CK_AES_CTR_PARAMS ctrParams;
+
+    params = (unsigned char *) &ctrParams;
+    paramsLength = sizeof(ctrParams);
+    memset(&ctrParams, 0, sizeof(ctrParams));
+    ctrParams.ulCounterBits = cipherLen > 16 ? 16 : cipherLen;
+    memcpy(ctrParams.cb, (unsigned char *)cipherTextToSample,
+           cipherLen > 16 ? 16 : cipherLen);
+    SECItem param = {siBuffer, params, paramsLength};
+  
+    PK11Context *EncContext = PK11_CreateContextBySymKey(mech,
+                                                         CKA_ENCRYPT,
+                                                         key,
+                                                         &param);
+    assert (EncContext);
+    
+    unsigned char outBuf[4];
+    assert(pnLen <= sizeof(outBuf));
+    int written;
+    PK11_CipherOp(EncContext, outBuf, &written, sizeof(outBuf), pn, pnLen);
+    memcpy(pn, outBuf, written);
+    PK11_DestroyContext(EncContext, PR_TRUE);
+  } else {
+    // todo Need an api for nss chacha20xor that lets us set the counter
+    assert(0);
+  }
+}
+
+void
+NSSHelper::staticDecryptPNInPlace(unsigned char *pn,
+                                  CID connectionID,
+                                  const unsigned char *cipherTextToSample,
+                                  uint32_t cipherLen)
+{
+  ServerHandshakeReceiverKeys keys(connectionID);
+
+  DecryptPNInPlace(pn, CKM_AES_CTR,
+                   keys.mPacketProtectionHandshakeReceiverPNKey,
+                   cipherTextToSample, cipherLen);
+}
+
+void
+NSSHelper::DecryptPNInPlace(enum operationType mode, unsigned char *pn,
+                            const unsigned char *cipherTextToSample,
+                            uint32_t cipherLen)
+{
+  assert (mode == kDecrypt0 || mode == kDecryptHandshake || kDecrypt0RTT);
+  CK_MECHANISM_TYPE mech = ModeToMechanism(mode);
+  PK11SymKey *key = ModeToPNKey(mode);
+
+  DecryptPNInPlace(pn, mech, key,
+                   cipherTextToSample, cipherLen);
+}
+
+void
+NSSHelper::DecryptPNInPlace(unsigned char *pn,
+                            CK_MECHANISM_TYPE mechToUse,
+                            PK11SymKey         *keyToUse,
+                            const unsigned char *cipherTextToSample,
+                            uint32_t cipherLen)
+{
+  if (!keyToUse) {
+    return;
+  }
+
+  // todo see issue 93 - chacha20 broken
+  assert (mechToUse == CKM_AES_CTR);
+    
+  CK_AES_CTR_PARAMS ctrParams;
+  unsigned char *params;
+  unsigned int paramsLength;
+
+  params = (unsigned char *) &ctrParams;
+  paramsLength = sizeof(ctrParams);
+  memset(&ctrParams, 0, sizeof(ctrParams));
+  ctrParams.ulCounterBits = cipherLen > 16 ? 16 : cipherLen;
+  memcpy(ctrParams.cb, (unsigned char *)cipherTextToSample,
+         cipherLen > 16 ? 16 : cipherLen);
+  SECItem param = {siBuffer, params, paramsLength};
+
+  PK11Context *context = PK11_CreateContextBySymKey(mechToUse,
+                                                    CKA_DECRYPT,
+                                                    keyToUse,
+                                                    &param);
+  assert(context);
+  unsigned char outBuf[4];
+  int written;
+  PK11_CipherOp(context, outBuf, &written, sizeof(outBuf), pn, 4);
+  PK11_DestroyContext(context, PR_TRUE);
+
+  size_t pnLen = 4;
+  if ((outBuf[0] & 0x80) == 0) {
+    pnLen = 1;
+  } else if ((outBuf[0] & 0xC0) == 0x80) {
+    pnLen = 2;
+  }
+
+  memcpy(pn, outBuf, pnLen);
 }
 
 uint32_t
@@ -929,18 +1132,19 @@ NSSHelper::EncryptBlock(const unsigned char *aadData, uint32_t aadLen,
 uint32_t
 NSSHelper::DecryptBlock(const unsigned char *aadData, uint32_t aadLen,
                         const unsigned char *ciphertext, uint32_t ciphertextLen,
-                        uint64_t packetNumber, unsigned char *out, uint32_t outAvail,
+                        uint64_t packetNumber,
+                        unsigned char *out, uint32_t outAvail,
                         uint32_t &written)
 {
   return BlockOperation(kDecrypt0, aadData, aadLen, ciphertext, ciphertextLen,
                         packetNumber, out, outAvail, written);
 }
 
-
 uint32_t
 NSSHelper::EncryptHandshake(const unsigned char *aadData, uint32_t aadLen,
                             const unsigned char *plaintext, uint32_t plaintextLen,
-                            uint64_t packetNumber, CID cid, unsigned char *out,
+                            uint64_t packetNumber,
+                            CID cid, unsigned char *out,
                             uint32_t outAvail, uint32_t &written)
 {
   if (cid != mPacketProtectionHandshakeCID) {
@@ -954,7 +1158,8 @@ NSSHelper::EncryptHandshake(const unsigned char *aadData, uint32_t aadLen,
 uint32_t
 NSSHelper::DecryptHandshake(const unsigned char *aadData, uint32_t aadLen,
                             const unsigned char *ciphertext, uint32_t ciphertextLen,
-                            uint64_t packetNumber, CID cid, unsigned char *out, uint32_t outAvail,
+                            uint64_t packetNumber,
+                            CID cid, unsigned char *out, uint32_t outAvail,
                             uint32_t &written)
 { 
   if (cid != mPacketProtectionHandshakeCID) {
@@ -968,7 +1173,8 @@ NSSHelper::DecryptHandshake(const unsigned char *aadData, uint32_t aadLen,
 uint32_t
 NSSHelper::EncryptBlock0RTT(const unsigned char *aadData, uint32_t aadLen,
                             const unsigned char *plaintext, uint32_t plaintextLen,
-                            uint64_t packetNumber, unsigned char *out,
+                            uint64_t packetNumber,
+                            unsigned char *out,
                             uint32_t outAvail, uint32_t &written)
 {
   return BlockOperation(kEncrypt0RTT, aadData, aadLen, plaintext, plaintextLen,
@@ -978,7 +1184,8 @@ NSSHelper::EncryptBlock0RTT(const unsigned char *aadData, uint32_t aadLen,
 uint32_t
 NSSHelper::DecryptBlock0RTT(const unsigned char *aadData, uint32_t aadLen,
                             const unsigned char *ciphertext, uint32_t ciphertextLen,
-                            uint64_t packetNumber, unsigned char *out, uint32_t outAvail,
+                            uint64_t packetNumber,
+                            unsigned char *out, uint32_t outAvail,
                             uint32_t &written)
 {
     return BlockOperation(kDecrypt0RTT, aadData, aadLen, ciphertext, ciphertextLen,
@@ -1011,7 +1218,9 @@ NSSHelper::SharedInit()
   // To disable any of the usual cipher suites..
   // SSL_CipherPrefSet(mFD, TLS_AES_128_GCM_SHA256, 0);
   // SSL_CipherPrefSet(mFD, TLS_AES_256_GCM_SHA384, 0);
-  // SSL_CipherPrefSet(mFD, TLS_CHACHA20_POLY1305_SHA256, 0);
+
+  // todo - encrpyted chacha20 packet numbers are waiting for an nss api
+  SSL_CipherPrefSet(mFD, TLS_CHACHA20_POLY1305_SHA256, 0);
 
   SSL_OptionSet(mFD, SSL_SECURITY, true);
   SSL_OptionSet(mFD, SSL_HANDSHAKE_AS_CLIENT, mIsClient);
@@ -1079,9 +1288,15 @@ NSSHelper::NSSHelper(MozQuic *quicSession, bool tolerateBadALPN, const char *ori
   , mExternalCipherSuite(0)
   , mLocalTransportExtensionLen(0)
   , mRemoteTransportExtensionLen(0)
+  , mPacketProtectionSenderPNKey(nullptr)
   , mPacketProtectionSenderKey0(nullptr)
+  , mPacketProtectionReceiverPNKey(nullptr)
   , mPacketProtectionReceiverKey0(nullptr)
+  , mPacketProtectionKey0RTT(nullptr)
+  , mPacketProtectionPNKey0RTT(nullptr)
+  , mPacketProtectionHandshakeSenderPNKey(nullptr)
   , mPacketProtectionHandshakeSenderKey(nullptr)
+  , mPacketProtectionHandshakeReceiverPNKey(nullptr)
   , mPacketProtectionHandshakeReceiverKey(nullptr)
 {
   SharedInit();
@@ -1117,9 +1332,15 @@ NSSHelper::NSSHelper(MozQuic *quicSession, bool tolerateBadALPN, const char *ori
   , mExternalCipherSuite(0)
   , mLocalTransportExtensionLen(0)
   , mRemoteTransportExtensionLen(0)
+  , mPacketProtectionSenderPNKey(nullptr)
   , mPacketProtectionSenderKey0(nullptr)
+  , mPacketProtectionReceiverPNKey(nullptr)
   , mPacketProtectionReceiverKey0(nullptr)
+  , mPacketProtectionKey0RTT(nullptr)
+  , mPacketProtectionPNKey0RTT(nullptr)
+  , mPacketProtectionHandshakeSenderPNKey(nullptr)
   , mPacketProtectionHandshakeSenderKey(nullptr)
+  , mPacketProtectionHandshakeReceiverPNKey(nullptr)
   , mPacketProtectionHandshakeReceiverKey(nullptr)
 {
   SharedInit();
@@ -1348,7 +1569,8 @@ NSSHelper::IsEarlyDataPossible()
 
   if (MakeKeyFromNSS(mFD, true, k0RTTLabel,
                      secretSize, keySize, hashType, importMechanism1, importMechanism2,
-                     mPacketProtectionIV0RTT, &mPacketProtectionKey0RTT) != MOZQUIC_OK) {
+                     mPacketProtectionIV0RTT,
+                     &mPacketProtectionKey0RTT, &mPacketProtectionPNKey0RTT) != MOZQUIC_OK) {
     return false;
   }
 
@@ -1376,14 +1598,16 @@ NSSHelper::IsEarlyDataAcceptedServer()
 
   if (MakeKeyFromNSS(mFD, true, k0RTTLabel,
                      secretSize, keySize, hashType, importMechanism1, importMechanism2,
-                     mPacketProtectionIV0RTT, &mPacketProtectionKey0RTT) != MOZQUIC_OK) {
+                     mPacketProtectionIV0RTT,
+                     &mPacketProtectionKey0RTT, &mPacketProtectionPNKey0RTT) != MOZQUIC_OK) {
     TlsLog6("IsEarlyDataAccepted fail 2\n");
     return false;
   }
 
   if (MakeKeyFromNSS(mFD, false, k1RTTServerLabel,
                      secretSize, keySize, hashType, importMechanism1, importMechanism2,
-                     mPacketProtectionSenderIV0, &mPacketProtectionSenderKey0) != MOZQUIC_OK) {
+                     mPacketProtectionSenderIV0,
+                     &mPacketProtectionSenderKey0, &mPacketProtectionSenderPNKey) != MOZQUIC_OK) {
     TlsLog6("IsEarlyDataAccepted fail 3\n");
     return false;
   }
@@ -1445,18 +1669,18 @@ NSSHelper::SockAddrHasher(const struct sockaddr *sock)
 
 NSSHelper::~NSSHelper()
 {
-  if (mPacketProtectionSenderKey0) {
-    PK11_FreeSymKey(mPacketProtectionSenderKey0);
-  }
-  if (mPacketProtectionReceiverKey0) {
-    PK11_FreeSymKey(mPacketProtectionReceiverKey0);
-  }
-  if (mPacketProtectionHandshakeSenderKey) {
-    PK11_FreeSymKey(mPacketProtectionHandshakeSenderKey);
-  }
-  if (mPacketProtectionHandshakeReceiverKey) {
-    PK11_FreeSymKey(mPacketProtectionHandshakeReceiverKey);
-  }
+  freeKey(mPacketProtectionSenderPNKey);
+  freeKey(mPacketProtectionSenderKey0);
+  freeKey(mPacketProtectionReceiverPNKey);
+  freeKey(mPacketProtectionReceiverKey0);
+  freeKey(mPacketProtectionKey0RTT);
+  freeKey(mPacketProtectionPNKey0RTT);
+  freeKey(mPacketProtectionHandshakeSenderPNKey);
+  freeKey(mPacketProtectionHandshakeSenderKey);
+  freeKey(mPacketProtectionHandshakeReceiverPNKey);
+  freeKey(mPacketProtectionHandshakeReceiverKey);
 }
 
 }
+
+

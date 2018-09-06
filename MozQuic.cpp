@@ -60,13 +60,12 @@ MozQuic::MozQuic(bool handleIO)
   , mClientPort(-1)
   , mValidStatelessResetToken(false)
   , mVersion(kMozQuicVersion1)
-//  , mVersion(kMozQuicIetfID11)
+//  , mVersion(kMozQuicIetfID12)
   , mClientOriginalOfferedVersion(0)
   , mMaxPacketConfig(kDefaultMaxPacketConfig)
   , mMTU(kInitialMTU)
   , mDropRate(0)
   , mNextTransmitPacketNumber(0)
-  , mOriginalTransmitPacketNumber(0)
   , mNextRecvPacketNumber(0)
   , mClientInitialPacketNumber(0)
   , mGenAckFor(0)
@@ -238,7 +237,7 @@ MozQuic::RealTransmit(const unsigned char *pkt, uint32_t len, const struct socka
 }
 
 uint32_t
-MozQuic::ProtectedTransmit(unsigned char *header, uint32_t headerLen,
+MozQuic::ProtectedTransmit(unsigned char *header, uint32_t headerLen, const unsigned char *pnPtr,
                            unsigned char *data, uint32_t dataLen, uint32_t dataAllocation,
                            bool addAcks, bool ackable, bool queueOnly, uint32_t MTU, uint32_t *bytesOut)
 {
@@ -290,17 +289,28 @@ MozQuic::ProtectedTransmit(unsigned char *header, uint32_t headerLen,
   unsigned char cipherPkt[kMaxMTU];
   memcpy(cipherPkt, header, headerLen);
   assert(headerLen + dataLen + 16 <= MTU);
+  assert(pnPtr < (header + headerLen));
+  assert(pnPtr > header);
   uint32_t rv = 0;
   if (mConnectionState == CLIENT_STATE_0RTT) {
     rv = mNSSHelper->EncryptBlock0RTT(header, headerLen, data, dataLen,
-                                      mNextTransmitPacketNumber, cipherPkt + headerLen,
-                                      MTU - headerLen, written);
+                                      mNextTransmitPacketNumber,
+                                      cipherPkt + headerLen, MTU - headerLen, written);
   } else {
     rv = mNSSHelper->EncryptBlock(header, headerLen, data, dataLen,
-                                  mNextTransmitPacketNumber, cipherPkt + headerLen,
-                                  MTU - headerLen, written);
+                                  mNextTransmitPacketNumber,
+                                  cipherPkt + headerLen, MTU - headerLen, written);
   }
+  // packet number encryption
+  assert(cipherPkt + (pnPtr - header) + 4 >= cipherPkt + headerLen); // pn + 4 is in ciphertext
+  assert(cipherPkt + (pnPtr - header) + 4 <= cipherPkt + headerLen + written);
 
+  
+  EncryptPNInPlace(mConnectionState == CLIENT_STATE_0RTT ? kEncrypt0RTT : kEncrypt0,
+                   cipherPkt + (pnPtr - header),
+                   cipherPkt + (pnPtr - header) + 4,
+                   (cipherPkt + headerLen + written) - (cipherPkt + (pnPtr - header) + 4));
+  
   ConnectionLog6("encrypt[%lX] rv=%d inputlen=%d (+%d of aead) outputlen=%d\n",
                  mNextTransmitPacketNumber, rv, dataLen, headerLen, written);
 
@@ -368,7 +378,8 @@ MozQuic::Shutdown(uint16_t code, const char *reason)
   // todo when transport params allow truncate id, the connid might go
   // short header with connid kp = 0, 4 bytes of packetnumber
   uint32_t used, headerLen;
-  CreateShortPacketHeader(plainPkt, mMTU - kTagLen, used);
+  unsigned char *pnPtr;
+  CreateShortPacketHeader(plainPkt, mMTU - kTagLen, used, &pnPtr);
   headerLen = used;
 
   plainPkt[used] = FRAME_TYPE_CONN_CLOSE;
@@ -390,8 +401,8 @@ MozQuic::Shutdown(uint16_t code, const char *reason)
     used += reasonLen;
   }
 
-  ProtectedTransmit(plainPkt, headerLen, plainPkt + headerLen, used - headerLen,
-                    mMTU - headerLen - kTagLen, false, true);
+  ProtectedTransmit(plainPkt, headerLen, pnPtr, plainPkt + headerLen,
+                    used - headerLen, mMTU - headerLen - kTagLen, false, true);
   mConnectionState = mIsClient ? CLIENT_STATE_CLOSED : SERVER_STATE_CLOSED;
 }
 
@@ -410,16 +421,6 @@ MozQuic::SetInitialPacketNumber()
 {
   mHighestTransmittedAckable = 0;
   mNextTransmitPacketNumber = 0;
-  for (int i=0; i < 2; i++) {
-    mNextTransmitPacketNumber = mNextTransmitPacketNumber << 16;
-    mNextTransmitPacketNumber |= random() & 0xffff;
-  }
-  mNextTransmitPacketNumber &= 0xffffffff; // 32 bits
-  mOriginalTransmitPacketNumber = mNextTransmitPacketNumber;
-  if (mNextTransmitPacketNumber > (0x100000000ULL - 1025)) {
-    // small range of unacceptable values - redo
-    SetInitialPacketNumber();
-  }
 }
 
 int
@@ -860,10 +861,6 @@ MozQuic::Intake(bool *partialResult)
 
     if (!(pkt[0] & 0x80)) { // short form protected packets
       ShortHeaderData tmpShortHeader(this, pkt, pktSize, 0, mLocalOmitCID, mLocalCID);
-      if (pktSize < tmpShortHeader.mHeaderSize) {
-        rv = MOZQUIC_ERR_GENERAL;
-        continue;
-      }
       CID temp;
       tmpSession = FindSession(tmpShortHeader.mDestCID);
       if (!tmpSession) {
@@ -875,9 +872,13 @@ MozQuic::Intake(bool *partialResult)
         continue;
       }
       session = tmpSession->mAlive;
-      ShortHeaderData shortHeader(this, pkt, pktSize, session->mNextRecvPacketNumber,
+      ShortHeaderData shortHeader(session.get(), pkt, pktSize, session->mNextRecvPacketNumber,
                                   mLocalOmitCID, mLocalCID);
       assert(shortHeader.mDestCID == tmpShortHeader.mDestCID);
+      if (pktSize < shortHeader.mHeaderSize) {
+        rv = MOZQUIC_ERR_GENERAL;
+        continue;
+      }
       ConnectionLogCID5(&tmpShortHeader.mDestCID, &temp,
                         "SHORTFORM PACKET[%d] pkt# %lX hdrsize=%d explicitcid=%d\n",
                         pktSize, shortHeader.mPacketNumber, shortHeader.mHeaderSize,
@@ -889,12 +890,16 @@ MozQuic::Intake(bool *partialResult)
       }
 
     } else {
-      LongHeaderData longHeader(pkt, pktSize);
+      LongHeaderData longHeader(mIsClient ? this : nullptr, pkt, pktSize, 0);
 
       if (longHeader.mType == PACKET_TYPE_ERR) {
         rv = MOZQUIC_ERR_GENERAL;
         continue;
       }
+
+      ConnectionLogCID5(&longHeader.mDestCID, &longHeader.mSourceCID,
+                        "LONGFORM PACKET [size=%d] type %X version %X\n",
+                        pktSize, longHeader.mType, longHeader.mVersion);
 
       if (!VersionOK(longHeader.mVersion)) { // version negotiation
         if (!mIsClient) {
@@ -925,10 +930,6 @@ MozQuic::Intake(bool *partialResult)
         coalescingLeftoverSize =
           pktSize - longHeader.mHeaderSize - longHeader.mPayloadLen;
       }
-
-      ConnectionLogCID5(&longHeader.mDestCID, &longHeader.mSourceCID,
-                        "LONGFORM PACKET[%d] pkt# %lX type %X version %X\n",
-                        pktSize, longHeader.mPacketNumber, longHeader.mType, longHeader.mVersion);
 
       if (longHeader.mType != PACKET_TYPE_0RTT_PROTECTED) {
         *partialResult = true;
@@ -971,6 +972,7 @@ MozQuic::Intake(bool *partialResult)
             break;
           } else {
             session = tmpSession->mAlive;
+            longHeader = LongHeaderData(session.get(), pkt, pktSize, 0);
           }
         } else {
           tmpSession = this;
@@ -1006,6 +1008,7 @@ MozQuic::Intake(bool *partialResult)
           continue;
         }
         session = tmpSession->mAlive;
+        longHeader = LongHeaderData(session.get(), pkt, pktSize, 0);
         break;
 
       default:
@@ -1013,11 +1016,15 @@ MozQuic::Intake(bool *partialResult)
         rv = MOZQUIC_ERR_GENERAL;
         break;
       }
-
+      
       if (!session || rv != MOZQUIC_OK) {
         ConnectionLog1("unable to find connection for packet\n");
         continue;
       }
+
+      ConnectionLogCID5(&longHeader.mDestCID, &longHeader.mSourceCID,
+                        "LONGFORM PACKET[%d] pkt# %lX type %X version %X\n",
+                        pktSize, longHeader.mPacketNumber, longHeader.mType, longHeader.mVersion);
 
       switch (longHeader.mType) {
 
@@ -1133,10 +1140,19 @@ MozQuic::IO()
 
   Timer::Tick();
   
-  if ((mConnectionState == SERVER_STATE_1RTT || mConnectionState == SERVER_STATE_0RTT ||
-       mConnectionState == CLIENT_STATE_1RTT || mConnectionState == CLIENT_STATE_0RTT) &&
-      (mNextTransmitPacketNumber - mOriginalTransmitPacketNumber) > 14) {
-    RaiseError(MOZQUIC_ERR_GENERAL, (char *)"TimedOut Client In Handshake");
+  if ((mNextTransmitPacketNumber > 14) &&
+      (mConnectionState == SERVER_STATE_1RTT || mConnectionState == SERVER_STATE_0RTT)) {
+    RaiseError(MOZQUIC_ERR_GENERAL, (char *)"server TimedOut an incomplete client handshake");
+    return MOZQUIC_ERR_GENERAL;
+  }
+
+  if ((mNextTransmitPacketNumber > 14) && (mConnectionState == CLIENT_STATE_1RTT)) {
+    RaiseError(MOZQUIC_ERR_GENERAL, (char *)"client TimedOut an incomplete 1rtt handshake");
+    return MOZQUIC_ERR_GENERAL;
+  }
+
+  if ((mNextTransmitPacketNumber > 24) && (mConnectionState == CLIENT_STATE_0RTT)) {
+    RaiseError(MOZQUIC_ERR_GENERAL, (char *)"client TimedOut an incomplete 0rtt handshake");
     return MOZQUIC_ERR_GENERAL;
   }
 
@@ -1402,8 +1418,8 @@ MozQuic::ServerConnected()
             "decode client parameters: "
             "maxstreamdata %u "
             "maxdatabytes %u "
-            "maxstreamidbidi %u "
-            "maxstreamiduni %u "
+            "maxstreambidiid %u "
+            "maxstreamuniid %u "
             "idle %u "
             "maxpacket %u\n",
             mStreamState->mPeerMaxStreamData,
@@ -1859,7 +1875,7 @@ bool
 MozQuic::VersionOK(uint32_t proposed)
 {
   if (proposed == kMozQuicVersion1 ||
-      proposed == kMozQuicIetfID11) {
+      proposed == kMozQuicIetfID12) {
     return true;
   }
   return false;
