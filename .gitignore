@@ -1,9 +1,19 @@
-*~
-*.swp
-*.o
-*.d
-/client
-/server
-/qdrive-client
-/qdrive-server
+# exclude everything
+*
 
+# git specific stuff
+!.gitignore
+
+# now reinclude everything that is needed
+# c/c++ related stuff
+!*.c
+!*.cpp
+!*.cc
+!*.cxx
+!*.h
+!*.hpp
+
+# cmake specific stuff
+!CMakeLists.txt
+!FindNSS.cmake
+!FindNSPR.cmake
