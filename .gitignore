@@ -17,3 +17,6 @@
 !CMakeLists.txt
 !FindNSS.cmake
 !FindNSPR.cmake
+
+#generated file
+sample/server_stuff.o
